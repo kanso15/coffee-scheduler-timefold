@@ -1,0 +1,483 @@
+# timefold_api.py
+# PURPOSE: Main Flask API that wraps Timefold constraint solver
+# WHAT IT DOES: Receives scheduling requests, runs Timefold solver, returns perfect schedules
+# WHERE IT RUNS: On Render.com cloud (or any Python hosting service)
+# ENDPOINTS:
+#   GET  /health - Check if API is alive
+#   POST /schedule - Generate a schedule
+#   POST /schedule/parse - Parse natural language requests
+
+from flask import Flask, request, jsonify
+from dataclasses import dataclass
+from datetime import time
+from typing import Annotated
+from timefold.solver import SolverFactory, SolverConfig
+from timefold.solver.domain import (
+    planning_entity, planning_solution, PlanningVariable,
+    PlanningEntityCollectionProperty, ProblemFactCollectionProperty,
+    ValueRangeProvider, PlanningScore
+)
+from timefold.solver.score import (
+    constraint_provider, Joiners, ConstraintFactory,
+    HardSoftScore, Constraint, ConstraintCollectors
+)
+from timefold.solver.config import TerminationConfig, ScoreDirectorFactoryConfig, Duration
+
+# ==================== DOMAIN MODEL ====================
+# These classes define your scheduling problem
+
+@dataclass
+class Employee:
+    """Represents an employee with their constraints"""
+    id: str
+    name: str
+    morning_only: bool = False  # Can only work morning shifts
+    is_fixed: bool = False      # Has a fixed off day (clean, shisha)
+    fixed_off_day: str = None   # Which day they're off (e.g., "thursday")
+    break_note: str = ""        # Break schedule note
+    
+    def __str__(self):
+        return self.name
+
+@dataclass
+class ShiftType:
+    """Represents a shift type (morning or night)"""
+    name: str  # "morning" or "night"
+    start_time: time
+    end_time: time
+    minimum_coverage: int  # Minimum employees needed
+    
+    def __str__(self):
+        return self.name
+
+@planning_entity
+@dataclass
+class Shift:
+    """Represents a shift that needs an employee assigned to it"""
+    id: str
+    day: str  # "monday", "tuesday", etc.
+    shift_type: ShiftType
+    
+    # This is what Timefold optimizes - which employee works this shift
+    employee: Annotated[Employee | None, PlanningVariable] = None
+    
+    def __str__(self):
+        return f"{self.day} {self.shift_type.name}"
+
+@planning_solution
+@dataclass
+class Schedule:
+    """The complete scheduling problem and solution"""
+    
+    # Input data
+    employees: Annotated[list[Employee], ProblemFactCollectionProperty, ValueRangeProvider]
+    shift_types: Annotated[list[ShiftType], ProblemFactCollectionProperty]
+    
+    # What Timefold will optimize
+    shifts: Annotated[list[Shift], PlanningEntityCollectionProperty]
+    
+    # The solution quality score
+    score: Annotated[HardSoftScore, PlanningScore] = None
+
+# ==================== CONSTRAINTS ====================
+# These are your business rules that Timefold enforces
+
+@constraint_provider
+def define_constraints(constraint_factory: ConstraintFactory) -> list[Constraint]:
+    """Define all scheduling constraints"""
+    return [
+        # HARD CONSTRAINTS (must be satisfied)
+        one_shift_per_employee_per_day(constraint_factory),
+        exactly_one_off_day_per_employee(constraint_factory),
+        morning_only_employees_constraint(constraint_factory),
+        fixed_employee_off_days(constraint_factory),
+        minimum_morning_coverage(constraint_factory),
+        minimum_night_coverage(constraint_factory),
+        
+        # SOFT CONSTRAINTS (nice to have)
+        distribute_off_days_evenly(constraint_factory),
+        prefer_employee_types(constraint_factory),
+    ]
+
+def one_shift_per_employee_per_day(factory: ConstraintFactory) -> Constraint:
+    """Each employee can only work one shift per day (no morning AND night)"""
+    return (
+        factory.for_each_unique_pair(Shift,
+            Joiners.equal(lambda s: s.employee),
+            Joiners.equal(lambda s: s.day)
+        )
+        .filter(lambda s1, s2: s1.employee is not None)
+        .penalize(HardSoftScore.ONE_HARD)
+        .as_constraint("One shift per employee per day")
+    )
+
+def exactly_one_off_day_per_employee(factory: ConstraintFactory) -> Constraint:
+    """Each employee must have exactly 1 off day per week (works 6 days)"""
+    return (
+        factory.for_each(Shift)
+        .filter(lambda s: s.employee is not None)
+        .group_by(lambda s: s.employee, lambda s: s.day)
+        .group_by(lambda emp, day: emp, ConstraintCollectors.count_distinct(lambda emp, day: day))
+        .filter(lambda emp, days: days != 6)
+        .penalize(HardSoftScore.ONE_HARD, lambda emp, days: abs(6 - days) * 100)
+        .as_constraint("Exactly one off day per employee")
+    )
+
+def morning_only_employees_constraint(factory: ConstraintFactory) -> Constraint:
+    """emp_1 and emp_7 can only work morning shifts"""
+    return (
+        factory.for_each(Shift)
+        .filter(lambda s: s.employee and s.employee.morning_only and s.shift_type.name == "night")
+        .penalize(HardSoftScore.ONE_HARD)
+        .as_constraint("Morning only employees")
+    )
+
+def fixed_employee_off_days(factory: ConstraintFactory) -> Constraint:
+    """clean must be off Thursday, shisha must be off Monday"""
+    return (
+        factory.for_each(Shift)
+        .filter(lambda s: s.employee and s.employee.is_fixed and 
+                s.employee.fixed_off_day and s.day == s.employee.fixed_off_day)
+        .penalize(HardSoftScore.ONE_HARD)
+        .as_constraint("Fixed employee off days")
+    )
+
+def minimum_morning_coverage(factory: ConstraintFactory) -> Constraint:
+    """Each day needs minimum 4 morning staff"""
+    return (
+        factory.for_each(Shift)
+        .filter(lambda s: s.shift_type.name == "morning")
+        .group_by(lambda s: s.day, ConstraintCollectors.count(lambda s: s.employee is not None))
+        .filter(lambda day, count: count < 4)
+        .penalize(HardSoftScore.ONE_HARD, lambda day, count: (4 - count) * 100)
+        .as_constraint("Minimum morning coverage")
+    )
+
+def minimum_night_coverage(factory: ConstraintFactory) -> Constraint:
+    """Each day needs minimum 5 night staff"""
+    return (
+        factory.for_each(Shift)
+        .filter(lambda s: s.shift_type.name == "night")
+        .group_by(lambda s: s.day, ConstraintCollectors.count(lambda s: s.employee is not None))
+        .filter(lambda day, count: count < 5)
+        .penalize(HardSoftScore.ONE_HARD, lambda day, count: (5 - count) * 100)
+        .as_constraint("Minimum night coverage")
+    )
+
+def distribute_off_days_evenly(factory: ConstraintFactory) -> Constraint:
+    """Try to spread off days evenly across the week (soft constraint)"""
+    return (
+        factory.for_each(Shift)
+        .filter(lambda s: s.employee is None)
+        .group_by(lambda s: s.day, ConstraintCollectors.count())
+        .penalize(HardSoftScore.ONE_SOFT, lambda day, count: count * count)
+        .as_constraint("Distribute off days evenly")
+    )
+
+def prefer_employee_types(factory: ConstraintFactory) -> Constraint:
+    """Prefer certain employees on night shifts (soft constraint)"""
+    return (
+        factory.for_each(Shift)
+        .filter(lambda s: s.employee and s.shift_type.name == "morning" and 
+                s.employee.id in ["emp_2", "emp_8"])
+        .penalize(HardSoftScore.ONE_SOFT)
+        .as_constraint("Prefer employee shift types")
+    )
+
+# ==================== DATA CREATION ====================
+# Create your 10 employees and shifts
+
+def create_employees(user_requests=None):
+    """Create the 10 employees with their constraints"""
+    employees = [
+        Employee("emp_1", "Employee 1", morning_only=True),
+        Employee("emp_2", "Employee 2"),
+        Employee("emp_3", "Employee 3"),
+        Employee("clean", "Clean", is_fixed=True, fixed_off_day="thursday",
+                break_note="Break: 4:30 PM - 6:00 PM daily"),
+        Employee("shisha", "Shisha", is_fixed=True, fixed_off_day="monday",
+                break_note="Break: 1:30 PM - 3:30 PM daily"),
+        Employee("emp_6", "Employee 6"),
+        Employee("emp_7", "Employee 7", morning_only=True),
+        Employee("emp_8", "Employee 8"),
+        Employee("emp_9", "Employee 9"),
+        Employee("emp_10", "Employee 10"),
+    ]
+    
+    # Apply user modifications if any
+    if user_requests:
+        for req in user_requests:
+            if req.get('type') == 'override_morning_only':
+                for emp in employees:
+                    if emp.id == req['employee']:
+                        emp.morning_only = False
+            elif req.get('type') == 'override_fixed_off':
+                for emp in employees:
+                    if emp.id == req['employee']:
+                        emp.fixed_off_day = req['day']
+    
+    return employees
+
+def create_shift_types():
+    """Create morning and night shift types"""
+    return [
+        ShiftType("morning", time(7, 30), time(16, 30), minimum_coverage=4),
+        ShiftType("night", time(16, 30), time(0, 0), minimum_coverage=5),
+    ]
+
+def create_shifts(shift_types, user_requests=None):
+    """Create all shifts for the week"""
+    days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    shifts = []
+    shift_id = 0
+    
+    # Track requested off days
+    requested_off = {}
+    if user_requests:
+        for req in user_requests:
+            if req.get('type') == 'off_day':
+                emp = req['employee']
+                day = req['day']
+                if emp not in requested_off:
+                    requested_off[emp] = []
+                requested_off[emp].append(day)
+    
+    for day in days:
+        for shift_type in shift_types:
+            shift = Shift(
+                id=f"shift_{shift_id}",
+                day=day,
+                shift_type=shift_type,
+                employee=None
+            )
+            shifts.append(shift)
+            shift_id += 1
+    
+    return shifts, requested_off
+
+def create_problem(user_requests=None):
+    """Create the complete scheduling problem"""
+    employees = create_employees(user_requests)
+    shift_types = create_shift_types()
+    shifts, requested_off = create_shifts(shift_types, user_requests)
+    
+    return Schedule(
+        employees=employees,
+        shift_types=shift_types,
+        shifts=shifts
+    ), requested_off
+
+# ==================== SOLVER ====================
+# Configure and run the Timefold solver
+
+def create_solver(timeout_seconds=30):
+    """Create the Timefold solver with configuration"""
+    solver_config = SolverConfig(
+        solution_class=Schedule,
+        entity_class_list=[Shift],
+        score_director_factory_config=ScoreDirectorFactoryConfig(
+            constraint_provider_function=define_constraints
+        ),
+        termination_config=TerminationConfig(
+            spent_limit=Duration(seconds=timeout_seconds)
+        )
+    )
+    return SolverFactory.create(solver_config).build_solver()
+
+def solve_schedule(user_requests=None, timeout=30):
+    """Solve the scheduling problem"""
+    problem, requested_off = create_problem(user_requests)
+    solver = create_solver(timeout)
+    solution = solver.solve(problem)
+    return solution, requested_off
+
+# ==================== JSON CONVERSION ====================
+# Convert Timefold solution to your Google Sheets format
+
+def solution_to_json(solution: Schedule, requested_off: dict):
+    """Convert Timefold solution to JSON format for Google Sheets"""
+    schedule = {"employees": {}}
+    days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    
+    # Initialize all employees with all days
+    for emp in solution.employees:
+        schedule["employees"][emp.id] = {
+            day: {"in": "Off", "out": "Off"} for day in days
+        }
+        schedule["employees"][emp.id]["note"] = emp.break_note
+    
+    # Fill in assigned shifts
+    for shift in solution.shifts:
+        if shift.employee:
+            emp_id = shift.employee.id
+            day = shift.day
+            
+            if shift.shift_type.name == "morning":
+                schedule["employees"][emp_id][day] = {"in": "7:30 AM", "out": "4:30 PM"}
+            else:  # night
+                schedule["employees"][emp_id][day] = {"in": "4:30 PM", "out": "12:00 AM"}
+    
+    # Special handling for clean and shisha (full day shifts)
+    for emp in solution.employees:
+        if emp.id == "clean":
+            for day in days:
+                if day != "thursday":
+                    schedule["employees"]["clean"][day] = {"in": "9:00 AM", "out": "12:00 AM"}
+        elif emp.id == "shisha":
+            for day in days:
+                if day != "monday":
+                    schedule["employees"]["shisha"][day] = {"in": "8:00 AM", "out": "12:00 AM"}
+    
+    # Generate message
+    if solution.score.is_feasible():
+        # Check coverage
+        coverage_issues = []
+        for day in days:
+            morning = sum(1 for s in solution.shifts 
+                         if s.day == day and s.shift_type.name == "morning" and s.employee)
+            night = sum(1 for s in solution.shifts 
+                       if s.day == day and s.shift_type.name == "night" and s.employee)
+            
+            if morning < 4:
+                coverage_issues.append(f"{day} understaffed morning ({morning}/4)")
+            if night < 5:
+                coverage_issues.append(f"{day} understaffed night ({night}/5)")
+        
+        if coverage_issues:
+            reasons = []
+            if requested_off:
+                for emp, days_off in requested_off.items():
+                    reasons.append(f"{emp} requested {', '.join(days_off)} off")
+            
+            reason_text = " due to " + "; ".join(reasons) if reasons else ""
+            message = f"Schedule meets user requests but {', '.join(coverage_issues)}{reason_text}."
+        else:
+            message = "Schedule is adequate."
+    else:
+        message = "Could not generate feasible schedule. Some hard constraints cannot be satisfied simultaneously."
+    
+    return {
+        "schedule": schedule,
+        "message": message,
+        "score": str(solution.score),
+        "feasible": solution.score.is_feasible()
+    }
+
+# ==================== FLASK API ====================
+# REST API endpoints for n8n to call
+
+app = Flask(__name__)
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint - returns 200 if API is alive"""
+    return jsonify({"status": "healthy", "service": "timefold-scheduler"}), 200
+
+@app.route('/schedule', methods=['POST'])
+def generate_schedule():
+    """
+    Main endpoint - generates a schedule
+    
+    POST body:
+    {
+        "requests": [
+            {"type": "off_day", "employee": "emp_3", "day": "friday"}
+        ],
+        "timeout": 30
+    }
+    
+    Returns:
+    {
+        "schedule": {...},
+        "message": "Schedule is adequate.",
+        "score": "0hard/-45soft",
+        "feasible": true
+    }
+    """
+    try:
+        data = request.json or {}
+        user_requests = data.get('requests', [])
+        timeout = data.get('timeout', 30)
+        
+        # Solve
+        solution, requested_off = solve_schedule(user_requests, timeout)
+        
+        # Convert to JSON
+        result = solution_to_json(solution, requested_off)
+        
+        return jsonify(result), 200
+    
+    except Exception as e:
+        return jsonify({
+            "error": str(e),
+            "message": "Failed to generate schedule"
+        }), 500
+
+@app.route('/schedule/parse', methods=['POST'])
+def parse_request():
+    """
+    Parse natural language into structured requests
+    
+    POST body:
+    {
+        "message": "Employee 3 needs Friday off"
+    }
+    
+    Returns:
+    {
+        "requests": [
+            {"type": "off_day", "employee": "emp_3", "day": "friday"}
+        ]
+    }
+    """
+    try:
+        data = request.json or {}
+        user_message = data.get('message', '')
+        
+        # Simple parsing logic
+        requests = []
+        
+        # Pattern: "Employee X needs Y off"
+        import re
+        off_pattern = re.compile(r'(employee|emp)\s*(\d+|clean|shisha)\s+needs?\s+(\w+)\s+off', re.IGNORECASE)
+        
+        for match in off_pattern.finditer(user_message):
+            emp_num = match.group(2).lower()
+            day = match.group(3).lower()
+            
+            emp_id = emp_num if emp_num in ['clean', 'shisha'] else f'emp_{emp_num}'
+            
+            # Normalize day
+            day_map = {
+                'mon': 'monday', 'monday': 'monday',
+                'tue': 'tuesday', 'tuesday': 'tuesday', 'tues': 'tuesday',
+                'wed': 'wednesday', 'wednesday': 'wednesday',
+                'thu': 'thursday', 'thursday': 'thursday', 'thurs': 'thursday',
+                'fri': 'friday', 'friday': 'friday',
+                'sat': 'saturday', 'saturday': 'saturday',
+                'sun': 'sunday', 'sunday': 'sunday'
+            }
+            
+            normalized_day = day_map.get(day, day)
+            
+            requests.append({
+                'type': 'off_day',
+                'employee': emp_id,
+                'day': normalized_day
+            })
+        
+        return jsonify({
+            "requests": requests,
+            "parsed_from": user_message
+        }), 200
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == '__main__':
+    print("Starting Timefold Scheduler API...")
+    print("Endpoints:")
+    print("  GET  /health - Health check")
+    print("  POST /schedule - Generate schedule")
+    print("  POST /schedule/parse - Parse natural language")
+    app.run(host='0.0.0.0', port=5000, debug=False)
