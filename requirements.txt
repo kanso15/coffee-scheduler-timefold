@@ -1,0 +1,9 @@
+# requirements.txt
+# PURPOSE: Lists all Python packages needed to run the API
+# USAGE: pip install -r requirements.txt
+
+# Timefold - The constraint solver (main dependency)
+timefold==1.15.0
+
+# Flask - Web framework for the REST API
+flask==3.0.3
