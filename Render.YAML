@@ -1,0 +1,27 @@
+# render.yaml
+# PURPOSE: Tells Render.com how to deploy your application
+# USAGE: Place in root of GitHub repo, Render auto-detects it
+# PLATFORM: Render.com (free tier)
+
+services:
+  # Define a web service
+  - type: web
+    name: coffee-scheduler
+    env: python
+    
+    # Build command - install dependencies
+    buildCommand: pip install -r requirements.txt
+    
+    # Start command - run the Flask app
+    startCommand: python timefold_api.py
+    
+    # Use free tier
+    plan: free
+    
+    # Health check endpoint (Render will ping this to check if app is alive)
+    healthCheckPath: /health
+    
+    # Environment variables
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
